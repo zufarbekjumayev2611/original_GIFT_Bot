@@ -159,9 +159,8 @@ async def _code_exists(code: str) -> bool:
 
 
 async def _generate_unique_code() -> str:
-    alphabet = string.ascii_uppercase + string.digits
     while True:
-        candidate = "".join(random.choices(alphabet, k=6))
+        candidate = "".join(random.choices(string.digits, k=4))
         if not await _code_exists(candidate):
             return candidate
 
