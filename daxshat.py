@@ -41,6 +41,7 @@ BOT_USERNAME = ""  # main() ichida avtomatik to'ldiriladi
 
 class AdminStates(StatesGroup):
     waiting_for_files = State()
+    waiting_for_gift_code = State()
     waiting_for_followup_video = State()
     waiting_for_followup_gift_delay = State()
     waiting_for_new_admin_id = State()
@@ -171,6 +172,15 @@ async def create_gift() -> tuple[int, str]:
         cur = await db.execute("INSERT INTO gifts (code) VALUES (?)", (code,))
         await db.commit()
         return cur.lastrowid, code
+
+
+async def create_gift_with_code(code: str) -> int:
+    """Admin o'zi tanlagan kod bilan sovg'a yaratadi. Kod band emasligi
+    chaqiruvchi tomonda (_code_exists orqali) oldindan tekshirilgan bo'lishi kerak."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("INSERT INTO gifts (code) VALUES (?)", (code,))
+        await db.commit()
+        return cur.lastrowid
 
 
 async def get_gift_id_by_code(code: str):
@@ -453,7 +463,22 @@ async def finish_add_gift(message: Message, state: FSMContext):
     if not files:
         await message.answer("Hali birorta ham fayl yubormadingiz. Kamida bitta fayl yuboring yoki /cancel bosing.")
         return
-    gift_id, code = await create_gift()
+    await state.set_state(AdminStates.waiting_for_gift_code)
+    await message.answer(
+        "Endi shu sovg'a uchun kodni tanlang:\n\n"
+        "🔤 O'zingiz xohlagan kodni yozib yuboring (masalan: <code>YANGIL2026</code> — "
+        "faqat harf va raqamlardan iborat, 3-20 belgi).\n"
+        "🎲 Yoki tasodifiy kod avtomatik yaratilishi uchun /auto bosing.\n"
+        "Bekor qilish uchun /cancel bosing.",
+        parse_mode="HTML"
+    )
+
+
+async def _finalize_gift(message: Message, state: FSMContext, gift_id: int, code: str):
+    """Kod (qo'lda yoki avtomatik) tanlangach, fayllarni bazaga yozib,
+    admin'ga natija va keyingi (dumaloq video) qadamni yuboradi."""
+    data = await state.get_data()
+    files = data.get("files", [])
     for position, f in enumerate(files):
         await add_file_to_gift(gift_id, f["file_id"], f["file_type"], f["caption"], position)
     link = f"https://t.me/{BOT_USERNAME}?start=gift_{gift_id}"
@@ -472,6 +497,41 @@ async def finish_add_gift(message: Message, state: FSMContext):
         f"yuborganingizdan keyin so'rayman, standart {delay} daqiqa).\n"
         f"Video qo'shmoqchi bo'lmasangiz /skip, bekor qilish uchun /cancel bosing."
     )
+
+
+@dp.message(AdminStates.waiting_for_gift_code, Command("auto"))
+async def gift_code_auto(message: Message, state: FSMContext):
+    gift_id, code = await create_gift()
+    await _finalize_gift(message, state, gift_id, code)
+
+
+@dp.message(AdminStates.waiting_for_gift_code, Command("cancel"))
+async def cancel_gift_code(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.")
+
+
+# Diqqat: bu handler F.text bilan ISTALGAN matnga mos keladi, shuning uchun
+# yuqoridagi /auto va /cancel'dan KEYIN turishi shart — aks holda ular ham
+# "kod" sifatida qabul qilinib qolar edi (aiogram handlerlarni ro'yxatga
+# olingan tartibda, birinchi mos kelganida to'xtab tekshiradi).
+@dp.message(AdminStates.waiting_for_gift_code, F.text)
+async def gift_code_custom(message: Message, state: FSMContext):
+    raw = message.text.strip().upper()
+    if not raw.isalnum() or not (3 <= len(raw) <= 20):
+        await message.answer(
+            "Kod faqat harf va raqamlardan iborat, 3-20 belgi bo'lishi kerak "
+            "(bo'shliq yoki maxsus belgilarsiz). Qayta urinib ko'ring, yoki /auto bosing."
+        )
+        return
+    if await _code_exists(raw):
+        await message.answer(
+            f"❌ <code>{raw}</code> kodi allaqachon band. Boshqa kod kiriting, yoki /auto bosing.",
+            parse_mode="HTML"
+        )
+        return
+    gift_id = await create_gift_with_code(raw)
+    await _finalize_gift(message, state, gift_id, raw)
 
 
 @dp.message(AdminStates.waiting_for_followup_video, Command("skip"))
