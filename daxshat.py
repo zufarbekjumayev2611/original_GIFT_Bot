@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
+import random
+import string
 from datetime import datetime
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, CommandObject, Command
+from aiogram.filters import CommandStart, CommandObject, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -16,7 +18,7 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramBadRequest
 
 # ====== SOZLAMALAR ======
-BOT_TOKEN = "8897249690:AAHCMiN1LtqXxF2tcpczYzp__FMHjhNpUOA"
+BOT_TOKEN = "8949758073:AAHN_yAycBiuQRo2oVfIqvsh-_h6ZXv_Qtw"
 CHANNEL_USERNAME = "@Sertifikat_pro"
 # Botni birinchi marta ishga tushirishda shu ID'lar avtomatik admin qilib qo'shiladi.
 # Keyinchalik yangi adminlarni botning o'zidan /add_admin orqali qo'shishingiz mumkin.
@@ -59,6 +61,7 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS gifts (
                 gift_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE,
                 followup_file_id TEXT,
                 followup_delay_minutes INTEGER
             )
@@ -149,11 +152,40 @@ async def set_followup_delay_minutes(minutes: int):
         await db.commit()
 
 
-async def create_gift() -> int:
+async def _code_exists(code: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("INSERT INTO gifts DEFAULT VALUES")
+        cur = await db.execute("SELECT 1 FROM gifts WHERE code = ?", (code,))
+        return (await cur.fetchone()) is not None
+
+
+async def _generate_unique_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        candidate = "".join(random.choices(alphabet, k=6))
+        if not await _code_exists(candidate):
+            return candidate
+
+
+async def create_gift() -> tuple[int, str]:
+    code = await _generate_unique_code()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("INSERT INTO gifts (code) VALUES (?)", (code,))
         await db.commit()
-        return cur.lastrowid
+        return cur.lastrowid, code
+
+
+async def get_gift_id_by_code(code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT gift_id FROM gifts WHERE code = ?", (code.strip().upper(),))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def get_gift_code(gift_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT code FROM gifts WHERE gift_id = ?", (gift_id,))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 
 async def add_file_to_gift(gift_id: int, file_id: str, file_type: str, caption: str | None, position: int):
@@ -358,6 +390,25 @@ async def gift_chosen_handler(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def redeem_code_handler(message: Message):
+    """Foydalanuvchi oddiy xabar sifatida sovg'a kodini yuborsa, shu kodga tegishli sovg'ani beradi."""
+    gift_id = await get_gift_id_by_code(message.text)
+    if gift_id is None:
+        await message.answer("Bunday kod topilmadi 🤔 Kodni tekshirib, qayta yuborib ko'ring.")
+        return
+    target = f"gift_{gift_id}"
+    if await is_subscribed(message.from_user.id):
+        await deliver_target(message.chat.id, message.from_user.id, message.from_user.full_name, target)
+    else:
+        await message.answer(
+            "Assalomu alaykum 🙈 Afsuski, siz hali kanalga obuna bo'lmagansiz, shu sababli "
+            "va'da qilingan videoni (yoki PDF-ni) sizga yubora olmayapman 😔 Iltimos, avval "
+            "kanalga obuna bo'ling, so'ngra \"✅ Obuna bo'ldim\" tugmasini bosing — sovg'angiz darrov yetib boradi 🎁",
+            reply_markup=subscribe_keyboard(target)
+        )
+
+
 # ---------- Admin oqimi: sovg'a qo'shish ----------
 
 @dp.message(Command("add_gift"))
@@ -403,13 +454,15 @@ async def finish_add_gift(message: Message, state: FSMContext):
     if not files:
         await message.answer("Hali birorta ham fayl yubormadingiz. Kamida bitta fayl yuboring yoki /cancel bosing.")
         return
-    gift_id = await create_gift()
+    gift_id, code = await create_gift()
     for position, f in enumerate(files):
         await add_file_to_gift(gift_id, f["file_id"], f["file_type"], f["caption"], position)
     link = f"https://t.me/{BOT_USERNAME}?start=gift_{gift_id}"
     await message.answer(
         f"✅ Sovg'a #{gift_id} — {len(files)} ta fayl bilan qo'shildi.\n\n"
-        f"Ushbu sovg'a uchun shaxsiy havola (uni Instagram va h.k. joylarga qo'ysangiz bo'ladi):\n{link}"
+        f"🔑 Sovg'a kodi (foydalanuvchi shu kodni botga oddiy xabar qilib yuborsa, sovg'ani oladi):\n<code>{code}</code>\n\n"
+        f"🔗 Yoki tayyor havola (Instagram va h.k. joylarga qo'yish uchun):\n{link}",
+        parse_mode="HTML"
     )
     delay = await get_followup_delay_minutes()
     await state.update_data(followup_gift_id=gift_id)
@@ -664,13 +717,14 @@ async def list_gifts_handler(message: Message):
     lines = []
     for gift_id in gift_ids:
         files = await get_gift_files(gift_id)
+        code = await get_gift_code(gift_id)
         followup_file_id, followup_delay = await get_gift_followup(gift_id)
         link = f"https://t.me/{BOT_USERNAME}?start=gift_{gift_id}"
         if followup_file_id:
             followup_note = f"✅ dumaloq video bor ({followup_delay} daqiqadan keyin)"
         else:
             followup_note = "➖ dumaloq video yo'q"
-        lines.append(f"Sovg'a #{gift_id} ({len(files)} ta fayl, {followup_note})\n{link}")
+        lines.append(f"Sovg'a #{gift_id} ({len(files)} ta fayl, {followup_note})\n🔑 Kod: {code}\n🔗 {link}")
     await message.answer("🎁 Mavjud sovg'alar:\n\n" + "\n\n".join(lines))
 
 
