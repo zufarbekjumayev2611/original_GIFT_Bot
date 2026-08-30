@@ -18,7 +18,7 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramBadRequest
 
 # ====== SOZLAMALAR ======
-BOT_TOKEN = "8897249690:AAHCMiN1LtqXxF2tcpczYzp__FMHjhNpUOA"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_USERNAME = "@Sertifikat_pro"
 # Botni birinchi marta ishga tushirishda shu ID'lar avtomatik admin qilib qo'shiladi.
 # Keyinchalik yangi adminlarni botning o'zidan /add_admin orqali qo'shishingiz mumkin.
