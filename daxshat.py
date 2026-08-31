@@ -27,6 +27,27 @@ INITIAL_ADMIN_IDS = [8113300476, 506095476]
 # Agar environment variable topilmasa (masalan lokal kompyuterda ishga tushirsangiz), oddiy "bot.db" ishlatiladi.
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
+
+def _check_db_path():
+    """DB_PATH papkasi mavjud va yozish mumkinligini tekshiradi, aniq
+    diagnostika chiqaradi (Render Disk muammolarini topish uchun)."""
+    directory = os.path.dirname(DB_PATH) or "."
+    logging.info(f"[DB tekshiruvi] DB_PATH = {DB_PATH}")
+    logging.info(f"[DB tekshiruvi] Papka: {directory}")
+    logging.info(f"[DB tekshiruvi] Papka mavjudmi: {os.path.isdir(directory)}")
+    if os.path.isdir(directory):
+        logging.info(f"[DB tekshiruvi] Papkaga yozish mumkinmi: {os.access(directory, os.W_OK)}")
+        try:
+            test_file = os.path.join(directory, ".write_test")
+            with open(test_file, "w") as f:
+                f.write("test")
+            os.remove(test_file)
+            logging.info("[DB tekshiruvi] Sinov fayli yozildi va o'chirildi — YOZISH ISHLAYDI ✅")
+        except Exception as e:
+            logging.error(f"[DB tekshiruvi] Sinov fayl yozib bo'lmadi — XATO: {e}")
+    else:
+        logging.error(f"[DB tekshiruvi] Papka '{directory}' MAVJUD EMAS — shuning uchun xato chiqyapti.")
+
 # Dumaloq video necha daqiqadan keyin yuborilishi uchun BOSHLANG'ICH (standart) qiymat.
 # Bu faqat birinchi marta ishlatiladi — keyin adminlar /set_followup_delay orqali botdan turib o'zgartira oladi.
 DEFAULT_FOLLOWUP_DELAY_MINUTES = 60
@@ -832,6 +853,7 @@ async def setup_commands():
 
 async def main():
     global BOT_USERNAME
+    _check_db_path()
     me = await bot.get_me()
     BOT_USERNAME = me.username
     await init_db()
