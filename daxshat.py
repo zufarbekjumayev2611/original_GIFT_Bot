@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -13,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat, MessageEntity
 )
 from aiogram.exceptions import TelegramBadRequest
 
@@ -98,6 +99,13 @@ async def init_db():
                 position INTEGER
             )
         """)
+        # Eski bazalarda bu ustun yo'q bo'lishi mumkin — mavjud bo'lmasa qo'shamiz.
+        # Premium/maxsus emojilarni caption matni bilan birga to'g'ri qayta
+        # yuborish uchun kerak (oddiy caption matni ularni saqlay olmaydi).
+        try:
+            await db.execute("ALTER TABLE gift_files ADD COLUMN caption_entities TEXT")
+        except Exception:
+            pass  # ustun allaqachon mavjud
         await db.execute("""
             CREATE TABLE IF NOT EXISTS claims (
                 user_id INTEGER,
@@ -218,11 +226,35 @@ async def get_gift_code(gift_id: int) -> str | None:
         return row[0] if row else None
 
 
-async def add_file_to_gift(gift_id: int, file_id: str, file_type: str, caption: str | None, position: int):
+def _entities_to_json(entities: list[MessageEntity] | None) -> str | None:
+    """Telegram entity ro'yxatini (premium emoji, qalin matn va h.k.) JSON
+    matn sifatida saqlash uchun tayyorlaydi."""
+    if not entities:
+        return None
+    return json.dumps([e.model_dump(mode="json", exclude_none=True) for e in entities])
+
+
+def _entities_from_json(raw: str | None) -> list[MessageEntity] | None:
+    """Bazadan o'qilgan JSON matnni Telegram'ga qayta yuborsa bo'ladigan
+    MessageEntity ro'yxatiga aylantiradi."""
+    if not raw:
+        return None
+    return [MessageEntity(**item) for item in json.loads(raw)]
+
+
+async def add_file_to_gift(
+    gift_id: int,
+    file_id: str,
+    file_type: str,
+    caption: str | None,
+    position: int,
+    caption_entities: list[MessageEntity] | None = None,
+):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO gift_files (gift_id, file_id, file_type, caption, position) VALUES (?, ?, ?, ?, ?)",
-            (gift_id, file_id, file_type, caption, position)
+            "INSERT INTO gift_files (gift_id, file_id, file_type, caption, position, caption_entities) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (gift_id, file_id, file_type, caption, position, _entities_to_json(caption_entities))
         )
         await db.commit()
 
@@ -241,12 +273,18 @@ async def gift_exists(gift_id: int) -> bool:
 
 
 async def get_gift_files(gift_id: int):
+    """Har bir element: (file_id, file_type, caption, caption_entities)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT file_id, file_type, caption FROM gift_files WHERE gift_id = ? ORDER BY position",
+            "SELECT file_id, file_type, caption, caption_entities FROM gift_files "
+            "WHERE gift_id = ? ORDER BY position",
             (gift_id,)
         )
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+        return [
+            (file_id, file_type, caption, _entities_from_json(entities_json))
+            for file_id, file_type, caption, entities_json in rows
+        ]
 
 
 async def mark_claim(user_id: int, gift_id: int, full_name: str) -> bool:
@@ -344,13 +382,13 @@ async def send_gift(chat_id: int, gift_id: int, user_id: int, full_name: str):
     if not files:
         await bot.send_message(chat_id, "🎁 Sovg'angiz\n\n(Bu sovg'aga hali fayl biriktirilmagan)")
     else:
-        for file_id, file_type, caption in files:
+        for file_id, file_type, caption, caption_entities in files:
             if file_type == "video":
-                await bot.send_video(chat_id, file_id, caption=caption)
+                await bot.send_video(chat_id, file_id, caption=caption, caption_entities=caption_entities)
             elif file_type == "document":
-                await bot.send_document(chat_id, file_id, caption=caption)
+                await bot.send_document(chat_id, file_id, caption=caption, caption_entities=caption_entities)
             elif file_type == "photo":
-                await bot.send_photo(chat_id, file_id, caption=caption)
+                await bot.send_photo(chat_id, file_id, caption=caption, caption_entities=caption_entities)
     is_new = await mark_claim(user_id, gift_id, full_name)
     if is_new:
         # Faqat ilk marta sovg'a olganda, shu sovg'aga tegishli dumaloq video rejalashtiriladi
@@ -457,7 +495,12 @@ async def add_gift_start(message: Message, state: FSMContext):
 async def _collect_file(message: Message, state: FSMContext, file_id: str, file_type: str):
     data = await state.get_data()
     files = data.get("files", [])
-    files.append({"file_id": file_id, "file_type": file_type, "caption": message.caption})
+    files.append({
+        "file_id": file_id,
+        "file_type": file_type,
+        "caption": message.caption,
+        "caption_entities": message.caption_entities,  # premium emoji, qalin matn va h.k. shu yerda saqlanadi
+    })
     await state.update_data(files=files)
     await message.answer(f"✅ Qabul qilindi ({len(files)} ta fayl). Yana yuborishingiz mumkin yoki /done bosing.")
 
@@ -501,7 +544,10 @@ async def _finalize_gift(message: Message, state: FSMContext, gift_id: int, code
     data = await state.get_data()
     files = data.get("files", [])
     for position, f in enumerate(files):
-        await add_file_to_gift(gift_id, f["file_id"], f["file_type"], f["caption"], position)
+        await add_file_to_gift(
+            gift_id, f["file_id"], f["file_type"], f["caption"], position,
+            caption_entities=f.get("caption_entities"),
+        )
     link = f"https://t.me/{BOT_USERNAME}?start=gift_{gift_id}"
     await message.answer(
         f"✅ Sovg'a #{gift_id} — {len(files)} ta fayl bilan qo'shildi.\n\n"
